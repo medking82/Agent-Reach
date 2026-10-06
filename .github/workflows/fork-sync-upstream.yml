@@ -1,0 +1,258 @@
+name: Prepare upstream sync
+
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      validate_current:
+        description: Validate the current merge even when upstream has no new commits
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/fork-sync-upstream.yml
+      - docs/fork-sync.md
+
+# Keep the repository default read-only. Publication requires separate consent.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: agent-reach-upstream-sync-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'medking82/Agent-Reach' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      check_needed: ${{ steps.merge.outputs.check_needed }}
+      workflow_changed: ${{ steps.merge.outputs.workflow_changed }}
+      base: ${{ steps.merge.outputs.base }}
+      upstream: ${{ steps.merge.outputs.upstream }}
+      candidate: ${{ steps.merge.outputs.candidate }}
+      bundle_sha256: ${{ steps.merge.outputs.bundle_sha256 }}
+      artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare candidate without changing remote branches
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATE_CURRENT: ${{ github.event_name == 'pull_request' || inputs.validate_current == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'changed=false\ncheck_needed=false\nworkflow_changed=false\n' >> "$GITHUB_OUTPUT"
+          test "$(gh api repos/medking82/Agent-Reach --jq '.full_name')" = 'medking82/Agent-Reach'
+          test "$(gh api repos/medking82/Agent-Reach --jq '.parent.full_name')" = 'Panniantong/Agent-Reach'
+          test "$(gh api repos/medking82/Agent-Reach --jq '.default_branch')" = main
+          test "$(gh api repos/Panniantong/Agent-Reach --jq '.default_branch')" = main
+          test "$(git remote get-url origin)" = 'https://github.com/medking82/Agent-Reach'
+          git config core.hooksPath /dev/null
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags --no-recurse-submodules origin refs/heads/main:refs/remotes/origin/maintained
+          git fetch --no-tags --no-recurse-submodules https://github.com/Panniantong/Agent-Reach.git refs/heads/main:refs/remotes/upstream/main
+          base=$(git rev-parse refs/remotes/origin/maintained)
+          upstream=$(git rev-parse refs/remotes/upstream/main)
+          changed=true
+          if git merge-base --is-ancestor "$upstream" "$base"; then
+            changed=false
+            echo 'Fork main already contains upstream main.' >> "$GITHUB_STEP_SUMMARY"
+            if [ "$VALIDATE_CURRENT" != true ]; then exit 0; fi
+          fi
+          pending=$(gh pr list --repo medking82/Agent-Reach --state open --head codex/upstream-sync --json number --jq 'length')
+          if [ "$pending" != 0 ]; then
+            echo 'A sync PR awaits review; preserve its commits and manual resolutions.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -n "$(git ls-remote origin refs/heads/codex/upstream-sync)" ]; then
+            git fetch --no-tags --no-recurse-submodules origin refs/heads/codex/upstream-sync:refs/remotes/origin/previous-sync
+            if ! git merge-base --is-ancestor refs/remotes/origin/previous-sync "$base"; then
+              echo 'Sync branch contains unmerged work. Review it explicitly; it will not be overwritten.' >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          fi
+          git checkout -b codex/upstream-sync "$base"
+          if ! git merge --no-edit "$upstream"; then
+            git diff --name-only --diff-filter=U > sync-conflicts.txt
+            echo 'Upstream merge conflicted; no remote branch was changed. Conflicting paths:' >> "$GITHUB_STEP_SUMMARY"
+            cat sync-conflicts.txt >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            exit 1
+          fi
+          candidate=$(git rev-parse HEAD)
+          git merge-base --is-ancestor "$base" "$candidate"
+          git merge-base --is-ancestor "$upstream" "$candidate"
+          git diff --check "$base" "$candidate"
+          if ! git diff --quiet "$base" "$candidate" -- .github/workflows; then
+            echo 'workflow_changed=true' >> "$GITHUB_OUTPUT"
+            echo 'Workflow files changed. Keep the tested bundle for manual review; GITHUB_TOKEN cannot publish workflow updates.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          git bundle create candidate.bundle refs/heads/codex/upstream-sync
+          bundle_sha256=$(sha256sum candidate.bundle | cut -d ' ' -f 1)
+          printf 'base=%s\nupstream=%s\ncandidate=%s\nbundle_sha256=%s\nchanged=%s\ncheck_needed=true\n' "$base" "$upstream" "$candidate" "$bundle_sha256" "$changed" >> "$GITHUB_OUTPUT"
+          printf 'Fork base: `%s`\n\nUpstream: `%s`\n\nCandidate: `%s`\n\nBundle SHA-256: `%s`\n' "$base" "$upstream" "$candidate" "$bundle_sha256" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save candidate for isolated validation and review
+        if: steps.merge.outputs.check_needed == 'true'
+        id: bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate.bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Save conflict paths
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-conflicts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sync-conflicts.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.check_needed == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+        python: ['3.10', '3.11', '3.12', '3.13']
+        include:
+          - os: windows-latest
+            python: '3.12'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: candidate-artifact
+          merge-multiple: true
+      - name: Check tested identity and checkout candidate
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate }}
+          BUNDLE_SHA256: ${{ needs.prepare.outputs.bundle_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ && "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s  candidate-artifact/candidate.bundle\n' "$BUNDLE_SHA256" | sha256sum --check --strict
+          git config core.hooksPath /dev/null
+          git bundle verify candidate-artifact/candidate.bundle
+          git fetch --no-tags candidate-artifact/candidate.bundle refs/heads/codex/upstream-sync:refs/remotes/tested/sync
+          test "$(git rev-parse refs/remotes/tested/sync)" = "$CANDIDATE_SHA"
+          git checkout --detach "$CANDIDATE_SHA"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install development dependencies in the disposable runner
+        shell: bash
+        run: python -m pip install -c constraints.txt -e '.[dev]'
+      - name: Run existing unit tests
+        shell: bash
+        run: |
+          export PATH="/c/Program Files/Git/bin:/c/Program Files/Git/usr/bin:$PATH"
+          python -m pytest tests/ -q
+      - name: Verify wheel packaging
+        if: matrix.os == 'ubuntu-24.04' && matrix.python == '3.12'
+        shell: bash
+        run: |
+          python -m pip install build
+          python -m build
+          python - <<'PY'
+          import collections
+          import glob
+          import zipfile
+          wheel = glob.glob('dist/*.whl')[0]
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+          assert not [name for name, count in collections.Counter(names).items() if count > 1]
+          assert 'agent_reach/skill/SKILL.md' in names
+          for prefix in ('agent_reach/guides/', 'agent_reach/scripts/', 'agent_reach/skill/references/'):
+              assert any(name.startswith(prefix) for name in names), prefix
+          print('Wheel has unique entries and expected package data.')
+          PY
+
+  publish:
+    needs: [prepare, validate]
+    # This job is a proposal: the consent variable is unset until explicitly approved.
+    # It never runs on PR events, other repositories/refs, or workflow-file updates.
+    if: >-
+      github.repository == 'medking82/Agent-Reach' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      vars.AGENT_REACH_ALLOW_SYNC_PRS == 'true' &&
+      needs.prepare.outputs.changed == 'true' &&
+      needs.prepare.outputs.workflow_changed == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: candidate-artifact
+          merge-multiple: true
+      - name: Publish the verified Git objects and open one draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.prepare.outputs.base }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate }}
+          BUNDLE_SHA256: ${{ needs.prepare.outputs.bundle_sha256 }}
+          CHECK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ && "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(gh api repos/medking82/Agent-Reach --jq '.full_name')" = 'medking82/Agent-Reach'
+          test "$(gh api repos/medking82/Agent-Reach --jq '.parent.full_name')" = 'Panniantong/Agent-Reach'
+          test "$(gh api repos/medking82/Agent-Reach --jq '.default_branch')" = main
+          test "$(gh api repos/Panniantong/Agent-Reach --jq '.default_branch')" = main
+          test "$(git remote get-url origin)" = 'https://github.com/medking82/Agent-Reach'
+          printf '%s  candidate-artifact/candidate.bundle\n' "$BUNDLE_SHA256" | sha256sum --check --strict
+          git config core.hooksPath /dev/null
+          git bundle verify candidate-artifact/candidate.bundle
+          git fetch --no-tags candidate-artifact/candidate.bundle refs/heads/codex/upstream-sync:refs/remotes/tested/sync
+          test "$(git rev-parse refs/remotes/tested/sync)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" "$CANDIDATE_SHA"
+          git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows
+          test "$(git ls-remote origin refs/heads/main | cut -f 1)" = "$BASE_SHA"
+          test "$(git ls-remote https://github.com/Panniantong/Agent-Reach.git refs/heads/main | cut -f 1)" = "$UPSTREAM_SHA"
+          pending=$(gh pr list --repo medking82/Agent-Reach --state open --head codex/upstream-sync --json number --jq 'length')
+          test "$pending" = 0
+          if [ -n "$(git ls-remote origin refs/heads/codex/upstream-sync)" ]; then
+            git fetch --no-tags --no-recurse-submodules origin refs/heads/codex/upstream-sync:refs/remotes/origin/previous-sync
+            git merge-base --is-ancestor refs/remotes/origin/previous-sync "$BASE_SHA"
+          fi
+          # No candidate checkout, package installation, or candidate code execution here.
+          # A normal push rejects concurrent branch edits; force is never used.
+          git -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push origin "$CANDIDATE_SHA:refs/heads/codex/upstream-sync"
+          printf 'Merge upstream main `%s` into fork main `%s`.\n\nCandidate `%s` passed the Linux Python 3.10-3.13 and Windows Python 3.12 unit tests and wheel checks: %s\n\nReview before merging. No deployment, release or account setup is performed. Use a merge commit to preserve upstream ancestry.\n' "$UPSTREAM_SHA" "$BASE_SHA" "$CANDIDATE_SHA" "$CHECK_RUN_URL" > sync-pr-body.md
+          gh pr create --repo medking82/Agent-Reach --base main --head codex/upstream-sync --draft --title 'Sync Agent-Reach upstream main' --body-file sync-pr-body.md
